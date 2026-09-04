@@ -2,7 +2,8 @@
 """iCloud (Find My) から自分のApple端末の位置を取得する。
 
 端末側には一切何も入れない。pyicloud経由で fmipservice を叩くだけ。
-初回だけ2FAが要る。以降は ~/.pyicloud のセッションcookieで非対話に動く。
+初回だけ2FAが要る。以降は保存済みセッション(既定 ~/.local/state/icloud-locate)で
+非対話に動く。
 
 測位が古い場合は refreshClient に shouldLocate を立てて能動的に測位要求を出し、
 新しい位置が返るまでポーリングする（Find Myアプリの「更新」相当）。
@@ -12,6 +13,7 @@ import json
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from getpass import getpass
 from os import environ
 
@@ -21,6 +23,19 @@ from pyicloud.exceptions import PyiCloudFailedLoginException  # noqa: F401
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
+
+
+def cookie_directory():
+    """セッションの保存先。
+
+    pyicloudの既定は $TMPDIR/pyicloud/<user> だが、Linuxでは /tmp が tmpfs のため
+    再起動でセッションが消えて2FAをやり直す羽目になる。永続する場所を既定にする。
+    """
+    env = environ.get("ICLOUD_COOKIE_DIR")
+    if env:
+        return str(Path(env).expanduser())
+    base = environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
+    return str(Path(base).expanduser() / "icloud-locate")
 
 
 def safe_keyring(apple_id):
@@ -42,7 +57,7 @@ def _needs_tty(apple_id):
 
 
 def connect(apple_id):
-    """まず保存済みセッション(~/.pyicloud)で認証を試し、駄目なときだけ対話に落とす。
+    """まず保存済みセッションで認証を試し、駄目なときだけ対話に落とす。
 
     セッションが生きていればパスワードもttyも不要なので、エージェントから
     非対話で呼べる。これが route-plan に組み込むための前提。
@@ -50,14 +65,14 @@ def connect(apple_id):
     password = environ.get("ICLOUD_PASSWORD") or safe_keyring(apple_id)
 
     try:
-        api = PyiCloudService(apple_id, password)
+        api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory())
     except Exception as exc:
         if not sys.stdin.isatty():
             log(f"→ セッション認証に失敗 ({type(exc).__name__}: {exc})")
             _needs_tty(apple_id)
         log(f"→ セッション認証に失敗 ({type(exc).__name__})。パスワードを入力してください。")
         password = getpass(f"iCloud password for {apple_id}: ")
-        api = PyiCloudService(apple_id, password)
+        api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory())
 
     if api.requires_2fa:
         if not sys.stdin.isatty():
