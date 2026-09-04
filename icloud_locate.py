@@ -92,6 +92,71 @@ def connect(apple_id):
     return api
 
 
+# pyicloudの_refresh_clientは selectedDevice を "all" 固定で送るため、
+# 全端末に測位要求が飛ぶ。ここでは対象端末のIDだけを指定して要求を出す。
+_FMIP_CLIENT_CONTEXT = {
+    "appName": "iCloud Find (Web)",
+    "appVersion": "2.0",
+    "apiVersion": "3.0",
+    "deviceListVersion": 1,
+    "timezone": "US/Pacific",
+    "inactiveTime": 0,
+}
+
+
+def _apply_response(manager, resp):
+    """refreshClientのレスポンスを manager の持つデバイス情報へ反映する。"""
+    server_ctx = resp.get("serverContext")
+    if server_ctx:
+        if "theftLoss" in server_ctx:
+            server_ctx["theftLoss"] = None
+        manager._server_ctx = server_ctx
+    for info in resp.get("content", []) or []:
+        dev = manager._devices.get(info.get("id"))
+        if dev is not None:
+            dev.update(info)
+
+
+def request_locate(manager, device_ids):
+    """selectedDevice に個別のデバイスIDを入れて測位要求を出す。
+
+    device_ids が空なら pyicloud 既定の "all" にフォールバックする。
+    """
+    if not device_ids:
+        manager.refresh(locate=True)
+        return
+
+    for device_id in device_ids:
+        ctx = dict(_FMIP_CLIENT_CONTEXT)
+        ctx.update({
+            "fmly": manager._with_family,
+            "shouldLocate": True,
+            "selectedDevice": device_id,
+        })
+        req_json = {"clientContext": ctx}
+        if manager._server_ctx:
+            req_json["serverContext"] = manager._server_ctx
+            req_json["isUpdatingAllLocations"] = False
+
+        resp = manager.session.post(
+            url=manager._fmip_refresh_url,
+            params=manager.params,
+            json=req_json,
+        )
+        _apply_response(manager, resp.json())
+
+
+def target_ids(manager, needle):
+    """--device に一致する端末のIDを返す。指定が無ければ空(=全端末)。"""
+    if not needle:
+        return []
+    return [
+        dev.data["id"]
+        for dev in manager.devices.values()
+        if matches(dev.data, needle) and "id" in dev.data
+    ]
+
+
 def matches(content, needle):
     if not needle:
         return True
@@ -143,19 +208,20 @@ def is_fresh(entry, max_age):
     )
 
 
-def locate_until_fresh(manager, needle, max_age, timeout, interval):
-    """shouldLocate を立てて能動的に測位要求を出し、新しい位置が返るまで待つ。
+def locate_until_fresh(manager, needle, max_age, timeout, interval, ids):
+    """能動的に測位要求を出し、新しい位置が返るまで待つ。
 
     Find Myアプリの「更新」と同じで、iCloud側から端末へプッシュして測り直させる。
     端末がスリープ・圏外だと応答しないので、必ずタイムアウトを持たせる。
     """
+    scope = f"{len(ids)}台を指定" if ids else "全端末(all)"
     deadline = time.time() + timeout
     attempt = 0
     while True:
         attempt += 1
-        log(f"→ 測位要求 {attempt}回目 (shouldLocate)")
+        log(f"→ 測位要求 {attempt}回目 (shouldLocate / {scope})")
         try:
-            manager.refresh(locate=True)
+            request_locate(manager, ids)
         except Exception as exc:
             log(f"   測位要求が失敗しました: {type(exc).__name__}: {exc}")
         current = snapshot(manager, needle)
@@ -180,6 +246,8 @@ def main():
     p.add_argument("--refresh", choices=["auto", "always", "never"], default="auto",
                    help="auto=古いときだけ測位要求 / always=常に / never=キャッシュのみ")
     p.add_argument("--refresh-timeout", type=int, default=45)
+    p.add_argument("--locate-scope", choices=["single", "all"], default="single",
+                   help="single=--deviceで絞った端末だけに測位要求 / all=全端末(pyicloud既定)")
     p.add_argument("--refresh-interval", type=int, default=5)
     args = p.parse_args()
 
@@ -195,9 +263,12 @@ def main():
     if args.refresh == "always" or (args.refresh == "auto" and stale):
         if args.refresh == "auto":
             log(f"→ {args.max_age}秒以内の測位がないので、端末に測位を要求します")
+        ids = target_ids(manager, args.device) if args.locate_scope == "single" else []
+        if args.locate_scope == "single" and not ids:
+            log("→ --device の指定が無いため全端末へ測位要求します")
         devices = locate_until_fresh(
             manager, args.device, args.max_age,
-            args.refresh_timeout, args.refresh_interval,
+            args.refresh_timeout, args.refresh_interval, ids,
         )
 
     for d in devices:
