@@ -37,6 +37,10 @@ iCloud（Find My）経由でApple端末の位置を取得するCLI。**iOS/iPadO
 ssh -t <host> '~/Documents/git-cloned/icloud-locate/locate.sh --apple-id <ID>'
 ```
 
+## 設定ファイル
+
+`~/.config/icloud-locate/env` に `ICLOUD_LOCATE_APPLE_ID` / `ICLOUD_LOCATE_DEVICE` があれば、`--apple-id` / `--device` を省略できる（優先順位はフラグ > 環境変数 > ファイル）。端末名が確定したら、このファイルに書くことをユーザーに提案してよい。**`ICLOUD_PASSWORD` はこのファイルにも書かない**（書いても無視される）。
+
 ## 非対話で呼ぶときの契約
 
 セッションが有効なら、パスワードもttyも不要で実行できる。これがエージェントから使うための前提。
@@ -60,6 +64,17 @@ ssh -t <host> '~/Documents/git-cloned/icloud-locate/locate.sh --apple-id <ID>'
 `fresh`（boolean）と`age_seconds`を必ず見る。`fresh: false`は測位が`--max-age`（既定600秒）より古いという意味。現在地として使う前にユーザーへ確認する。
 
 `location_available: false`の端末は座標を持たない。オフラインか位置共有オフなので、`--refresh always`にしても解決しない。
+
+## 常駐API（server.py）を使う場合
+
+常駐APIが動いていれば、CLI より先にそちらを使う。`curl -s http://127.0.0.1:8765/health` で確認できる。
+
+- `GET /location?device=<登録名>&refresh=auto` が CLI の `--device ... --json` に相当する。応答の形も同じ
+- `503`（`error: auth_required`）は CLI の終了コード`2`と同じ。**再認証をユーザーに依頼する**。サーバーの再起動は不要
+- `502` は iCloud 側の一時的なエラー。`404` は端末名の誤り
+- 応答にトークンが要る構成（`--token-file`）では、トークンファイルの中身をチャットやログに出さない
+- サーバー稼働中に CLI を併用するとセッションファイルを奪い合う。再認証以外は API を使う
+- `tailscale-serve.sh up` は tailnet 内へ公開する操作。ユーザーに確認してから実行する。`tailscale serve reset` は他のサービスの公開も消すので使わない
 
 ## パラメータの選び方
 

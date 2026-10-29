@@ -38,6 +38,42 @@ def cookie_directory():
     return str(Path(base).expanduser() / "icloud-locate")
 
 
+def env_file():
+    """設定ファイルの場所。既定は ~/.config/icloud-locate/env。"""
+    env = environ.get("ICLOUD_LOCATE_ENV_FILE")
+    if env:
+        return Path(env).expanduser()
+    base = environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base).expanduser() / "icloud-locate" / "env"
+
+
+def load_env_file():
+    """設定ファイルの KEY=VALUE を環境変数に読み込む。
+
+    既に設定されている環境変数は上書きしない（フラグ > 環境変数 > ファイル）。
+    パスワードはファイルに書かせない方針なので ICLOUD_PASSWORD は無視する。
+    """
+    path = env_file()
+    if not path.is_file():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, sep, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key == "ICLOUD_PASSWORD":
+            log(f"!! {path} の ICLOUD_PASSWORD は無視します。パスワードはファイルに書かないでください")
+            continue
+        environ.setdefault(key, value)
+
+
 def safe_keyring(apple_id):
     """keyringバックエンドが無い環境でも落ちないパスワード取得。"""
     try:
@@ -49,33 +85,44 @@ def safe_keyring(apple_id):
         return None
 
 
+class AuthRequired(Exception):
+    """保存済みセッションでは認証できず、人間の再認証(2FA)が要る。"""
+
+
 def _needs_tty(apple_id):
-    log("!! 保存済みセッションでは認証できませんでした。")
-    log("   ttyのある環境で一度だけ対話実行し、2FAを通してください:")
-    log(f"   ssh -t <host> '~/Documents/git-cloned/icloud-locate/locate.sh --apple-id {apple_id}'")
-    sys.exit(2)
+    raise AuthRequired(
+        "保存済みセッションでは認証できませんでした。"
+        "ttyのある環境で一度だけ対話実行し、2FAを通してください: "
+        f"ssh -t <host> '~/Documents/git-cloned/icloud-locate/locate.sh --apple-id {apple_id}'"
+    )
 
 
-def connect(apple_id):
+def connect(apple_id, interactive=None, **service_kwargs):
     """まず保存済みセッションで認証を試し、駄目なときだけ対話に落とす。
 
     セッションが生きていればパスワードもttyも不要なので、エージェントから
     非対話で呼べる。これが route-plan に組み込むための前提。
+    interactive が None なら stdin が tty かどうかで決める。非対話で再認証が
+    要るときは AuthRequired を投げる。
     """
+    if interactive is None:
+        interactive = sys.stdin.isatty()
     password = environ.get("ICLOUD_PASSWORD") or safe_keyring(apple_id)
 
     try:
-        api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory())
+        api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory(),
+                              **service_kwargs)
     except Exception as exc:
-        if not sys.stdin.isatty():
+        if not interactive:
             log(f"→ セッション認証に失敗 ({type(exc).__name__}: {exc})")
             _needs_tty(apple_id)
         log(f"→ セッション認証に失敗 ({type(exc).__name__})。パスワードを入力してください。")
         password = getpass(f"iCloud password for {apple_id}: ")
-        api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory())
+        api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory(),
+                              **service_kwargs)
 
     if api.requires_2fa:
-        if not sys.stdin.isatty():
+        if not interactive:
             log("→ 2FAが要求されました（セッション期限切れ）")
             _needs_tty(apple_id)
         log("→ 2FAが必要です。信頼済み端末に届いた6桁コードを入力してください。")
@@ -88,7 +135,7 @@ def connect(apple_id):
             log("→ セッションを信頼済みにします (次回から非対話で動きます)")
             api.trust_session()
     elif api.requires_2sa:
-        if not sys.stdin.isatty():
+        if not interactive:
             _needs_tty(apple_id)
         log("→ 旧2SAフローが要求されました。信頼済み端末を選んでください。")
         devices = api.trusted_devices
@@ -251,10 +298,37 @@ def locate_until_fresh(manager, needle, max_age, timeout, interval, ids):
         time.sleep(interval)
 
 
+def locate(manager, needle, max_age=600, refresh="auto", timeout=45, interval=5,
+           scope="single"):
+    """対象端末の要約リストを返す。必要なら測位要求を出して新しい位置を待つ。
+
+    CLI と常駐API(server.py)の共通処理。該当端末が無ければ空リストを返す。
+    """
+    devices = snapshot(manager, needle)
+    if not devices:
+        return devices
+
+    stale = not any(is_fresh(d, max_age) for d in devices)
+    if refresh == "always" or (refresh == "auto" and stale):
+        if refresh == "auto":
+            log(f"→ {max_age}秒以内の測位がないので、端末に測位を要求します")
+        ids = target_ids(manager, needle) if scope == "single" else []
+        if scope == "single" and not ids:
+            log("→ --device の指定が無いため全端末へ測位要求します")
+        devices = locate_until_fresh(manager, needle, max_age, timeout, interval, ids)
+
+    for d in devices:
+        d["fresh"] = is_fresh(d, max_age)
+    return devices
+
+
 def main():
+    load_env_file()
     p = argparse.ArgumentParser()
-    p.add_argument("--apple-id", required=True)
-    p.add_argument("--device", default=None, help="端末名・モデル名の部分一致で絞り込む")
+    p.add_argument("--apple-id", default=environ.get("ICLOUD_LOCATE_APPLE_ID"),
+                   help=f"省略時は ICLOUD_LOCATE_APPLE_ID（{env_file()} にも書ける）")
+    p.add_argument("--device", default=environ.get("ICLOUD_LOCATE_DEVICE"),
+                   help="端末名・モデル名の部分一致で絞り込む")
     p.add_argument("--json", action="store_true")
     p.add_argument("--max-age", type=int, default=600,
                    help="この秒数以内の測位を「新しい」とみなす (既定600=10分)")
@@ -265,29 +339,23 @@ def main():
                    help="single=--deviceで絞った端末だけに測位要求 / all=全端末(pyicloud既定)")
     p.add_argument("--refresh-interval", type=int, default=5)
     args = p.parse_args()
+    if not args.apple_id:
+        p.error(f"--apple-id か ICLOUD_LOCATE_APPLE_ID（{env_file()}）が必要です")
 
-    api = connect(args.apple_id)
+    try:
+        api = connect(args.apple_id)
+    except AuthRequired as exc:
+        log(f"!! {exc}")
+        sys.exit(2)
     manager = api.devices
 
-    devices = snapshot(manager, args.device)
+    devices = locate(
+        manager, args.device, args.max_age, args.refresh,
+        args.refresh_timeout, args.refresh_interval, args.locate_scope,
+    )
     if not devices:
         log("該当する端末がありません")
         sys.exit(1)
-
-    stale = not any(is_fresh(d, args.max_age) for d in devices)
-    if args.refresh == "always" or (args.refresh == "auto" and stale):
-        if args.refresh == "auto":
-            log(f"→ {args.max_age}秒以内の測位がないので、端末に測位を要求します")
-        ids = target_ids(manager, args.device) if args.locate_scope == "single" else []
-        if args.locate_scope == "single" and not ids:
-            log("→ --device の指定が無いため全端末へ測位要求します")
-        devices = locate_until_fresh(
-            manager, args.device, args.max_age,
-            args.refresh_timeout, args.refresh_interval, ids,
-        )
-
-    for d in devices:
-        d["fresh"] = is_fresh(d, args.max_age)
 
     if args.json:
         print(json.dumps(devices, ensure_ascii=False, indent=2))

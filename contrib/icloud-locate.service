@@ -1,0 +1,15 @@
+# ユーザー単位の systemd サービス。インストール手順は README の「常駐APIとして動かす」を参照。
+[Unit]
+Description=icloud-locate HTTP API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Apple ID などの設定は serve.sh が ~/.config/icloud-locate/env から自分で読む
+ExecStart=%h/Documents/git-cloned/icloud-locate/serve.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
