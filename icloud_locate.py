@@ -18,7 +18,22 @@ from getpass import getpass
 from os import environ
 
 from pyicloud import PyiCloudService
-from pyicloud.exceptions import PyiCloudFailedLoginException  # noqa: F401
+from pyicloud.exceptions import (
+    PyiCloud2FARequiredException,
+    PyiCloud2SARequiredException,
+    PyiCloudAuthRequiredException,
+    PyiCloudFailedLoginException,
+    PyiCloudNoStoredPasswordAvailableException,
+)
+
+# セッション切れを表す例外。api.devices など、接続後の最初の呼び出しで初めて飛ぶこともある
+SESSION_ERRORS = (
+    PyiCloudAuthRequiredException,
+    PyiCloudFailedLoginException,
+    PyiCloud2FARequiredException,
+    PyiCloud2SARequiredException,
+    PyiCloudNoStoredPasswordAvailableException,
+)
 
 
 def log(msg):
@@ -97,29 +112,41 @@ def _needs_tty(apple_id):
     )
 
 
-def connect(apple_id, interactive=None, **service_kwargs):
+def connect(apple_id, interactive=None, force_password=False, **service_kwargs):
     """まず保存済みセッションで認証を試し、駄目なときだけ対話に落とす。
 
     セッションが生きていればパスワードもttyも不要なので、エージェントから
     非対話で呼べる。これが route-plan に組み込むための前提。
     interactive が None なら stdin が tty かどうかで決める。非対話で再認証が
     要るときは AuthRequired を投げる。
+
+    force_password は、PyiCloudService の生成は通ったのに後の呼び出しで
+    トークンを拒否されたとき用。パスワードを聞いて認証をやり直す。
     """
     if interactive is None:
         interactive = sys.stdin.isatty()
     password = environ.get("ICLOUD_PASSWORD") or safe_keyring(apple_id)
 
-    try:
-        api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory(),
-                              **service_kwargs)
-    except Exception as exc:
+    if force_password:
         if not interactive:
-            log(f"→ セッション認証に失敗 ({type(exc).__name__}: {exc})")
             _needs_tty(apple_id)
-        log(f"→ セッション認証に失敗 ({type(exc).__name__})。パスワードを入力してください。")
+        log("→ 保存済みセッションが iCloud に拒否されました。パスワードを入力してください。")
         password = getpass(f"iCloud password for {apple_id}: ")
         api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory(),
                               **service_kwargs)
+        api.authenticate(force_refresh=True)
+    else:
+        try:
+            api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory(),
+                                  **service_kwargs)
+        except Exception as exc:
+            if not interactive:
+                log(f"→ セッション認証に失敗 ({type(exc).__name__}: {exc})")
+                _needs_tty(apple_id)
+            log(f"→ セッション認証に失敗 ({type(exc).__name__})。パスワードを入力してください。")
+            password = getpass(f"iCloud password for {apple_id}: ")
+            api = PyiCloudService(apple_id, password, cookie_directory=cookie_directory(),
+                                  **service_kwargs)
 
     if api.requires_2fa:
         if not interactive:
@@ -322,6 +349,21 @@ def locate(manager, needle, max_age=600, refresh="auto", timeout=45, interval=5,
     return devices
 
 
+def open_devices(apple_id):
+    """接続して端末マネージャを返す。
+
+    保存済みトークンは PyiCloudService の生成時には通っても、api.devices の
+    最初の問い合わせで拒否されることがある（pyicloud はそこでパスワード無しの
+    再ログインを試みて失敗する）。その場合も再認証が要るものとして扱う。
+    """
+    interactive = sys.stdin.isatty()
+    try:
+        return connect(apple_id, interactive).devices
+    except SESSION_ERRORS as exc:
+        log(f"→ セッションが無効です ({type(exc).__name__})")
+    return connect(apple_id, interactive, force_password=True).devices
+
+
 def main():
     load_env_file()
     p = argparse.ArgumentParser()
@@ -343,11 +385,10 @@ def main():
         p.error(f"--apple-id か ICLOUD_LOCATE_APPLE_ID（{env_file()}）が必要です")
 
     try:
-        api = connect(args.apple_id)
+        manager = open_devices(args.apple_id)
     except AuthRequired as exc:
         log(f"!! {exc}")
         sys.exit(2)
-    manager = api.devices
 
     devices = locate(
         manager, args.device, args.max_age, args.refresh,
